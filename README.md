@@ -146,13 +146,24 @@ of why a "just push it faster" setpoint write is dangerous.
 
 0-based PDU addressing. Supported function codes: **1, 2** (read coils /
 discrete inputs), **3, 4** (read holding / input registers), **5, 6** (write
-single coil / register), **15, 16** (write multiple).
+single coil / register), **15, 16** (write multiple), and **43 / MEI 14** (Read
+Device Identification).
 
 | Request | Response |
 |---|---|
-| Any other function code, including FC 43/14 Read Device Identification and FC 17 Report Server ID | exception **01** Illegal Function |
+| Any other function code, including FC 17 Report Server ID | exception **01** Illegal Function |
+| FC 43 with an MEI type other than 14 | exception **01** Illegal Function |
+| FC 43 / 14 read code 04 for an object that doesn't exist | exception **02** Illegal Data Address |
+| FC 43 / 14 with a read code other than 01-04 | exception **03** Illegal Data Value |
 | Range past the end of a bank, or a quantity over 2000 bits / 125 registers | exception **02** Illegal Data Address |
 | FC 5 with a value other than `0xFF00` / `0x0000`, or a truncated PDU | exception **03** Illegal Data Value |
+
+FC 43 answers read codes 01 (basic), 02 (regular), 03 (extended: none are
+defined, so it returns the regular set) and 04 (one object). The identity
+itself (vendor, product code, revision, URL, product and model name, and
+application name) is set in `DEVICE_ID_OBJECTS` in `conveyor_belt.py`. It is
+left out of this README so the README doesn't give away the answer to the
+fingerprinting exercise.
 
 * **Unit ID:** the banner and HMI say unit 1, but the sim answers on **any** unit
   ID and echoes it back.
@@ -310,9 +321,13 @@ works, including AtomICS (**Protocol Modules → Modbus**; writes need
 7. **Setpoint tampering.** While running at 75 %, write 50 to HR7 with
    `mbpoll -m tcp -p 5020 -a 1 -t 4 -r 8 127.0.0.1 50`. The line trips
    immediately, and Fault Reset stays refused until HR7 is put back to 140.
-8. **Protocol edges.** FC 43 Read Device Identification returns exception 01
-   (AtomICS reports *device did not respond to FC 43*). A read past address 255
-   returns exception 02. A request to unit ID 7 is answered as unit 7.
+8. **Fingerprint the PLC.** Send FC 43 Read Device Identification (AtomICS:
+   Modbus menu 9, or Auto-Fingerprint). The controller gives up its vendor,
+   model, firmware revision and even its application name without
+   authentication. Then look up that product's advisories.
+9. **Protocol edges.** FC 17 Report Server ID returns exception 01. A read past
+   address 255 returns exception 02. A request to unit ID 7 is answered as
+   unit 7.
 
 Pair it with [MOTH](https://github.com/utilsec/moth) to compare a responding
 PLC against a honeypot that alerts on the same traffic.

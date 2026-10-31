@@ -34,6 +34,16 @@ trips at 10 s, 90 % at about 8 s and 17 s, 80 % at about 25 s and 50 s.  The
 trip is latched at a critical winding temperature (140 C, Class F), the PLC
 forces the conveyor to stop, and the fault will not reset until the motor has
 cooled well below the trip point.
+
+CHANGELOG
+  v1.1  Modbus FC 43 / MEI 14 Read Device Identification is now answered
+        (basic + regular objects, stream and individual access, per Modbus
+        Application Protocol v1.1b3 s6.21) with a Schneider Modicon M221
+        (TM221CE24T) identity, for the device-fingerprinting lab. It previously
+        returned exception 01 Illegal Function. Identity lives in
+        DEVICE_ID_OBJECTS beside the Modbus server. FC 17 Report Server ID is
+        still unsupported (exception 01).
+  v1.0  Baseline (formerly plc_sim.py).
 """
 
 import argparse
@@ -46,6 +56,8 @@ import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+VERSION = "1.1"
 
 # --------------------------------------------------------------------------
 # Tag / register map  (0-based Modbus PDU addressing)
@@ -564,6 +576,30 @@ EXC_ILLEGAL_ADDRESS = 0x02
 EXC_ILLEGAL_VALUE = 0x03
 EXC_SERVER_FAILURE = 0x04
 
+# --- Read Device Identification (FC 0x2B / MEI 0x0E) ----------------------
+# Modbus Application Protocol v1.1b3, section 6.21.  Identity: Schneider
+# Modicon M221 -- a small machine-level logic controller, typical of a single
+# conveyor zone.  Deliberately distinct from the MOTH honeypot (Modicon M340)
+# and Clearwater (Modicon M580) so each lab target has its own fingerprint.
+# Edit this table to give the lab a different identity.
+FC_READ_DEVICE_ID = 0x2B
+MEI_READ_DEVICE_ID = 0x0E
+DEVICE_ID_OBJECTS = {
+    0x00: "Schneider Electric",           # VendorName           (basic)
+    0x01: "TM221CE24T",                   # ProductCode          (basic)
+    0x02: "1.10",                         # MajorMinorRevision   (basic)
+    0x03: "https://www.se.com",           # VendorUrl            (regular)
+    0x04: "Modicon M221",                 # ProductName          (regular)
+    0x05: "TM221CE24T Logic Controller",  # ModelName            (regular)
+    0x06: "CONVEYOR-ZONE1-PLC01",         # UserApplicationName  (regular)
+}
+# Highest object id each stream read code may return (categories are
+# cumulative: regular includes basic).  No extended (0x80+) objects are
+# defined, so code 03 returns the same set as code 02.
+DEVICE_ID_STREAM_TOP = {0x01: 0x02, 0x02: 0x7F, 0x03: 0xFF}
+DEVICE_ID_CONFORMITY = 0x82   # regular identification, stream + individual access
+MODBUS_MAX_PDU = 253
+
 
 class ModbusHandler(socketserver.BaseRequestHandler):
     def handle(self):
@@ -670,9 +706,55 @@ class ModbusHandler(socketserver.BaseRequestHandler):
                     model.write_holding(addr + i, val)
                 return struct.pack(">BHH", fc, addr, qty)
 
+            if fc == FC_READ_DEVICE_ID:                  # FC 43 / MEI 14
+                return self._read_device_id(pdu)
+
             return self._exc(fc, EXC_ILLEGAL_FUNCTION)
         except (struct.error, IndexError):
             return self._exc(fc, EXC_ILLEGAL_VALUE)
+
+
+    def _read_device_id(self, pdu):
+        """FC 43 / MEI 14 Read Device Identification (MB spec s6.21).
+
+        Read code 01 basic, 02 regular, 03 extended (stream access, starting at
+        the requested object id -- or at object 0 if that id is unknown, as the
+        spec requires); 04 one specific object (unknown id -> exception 02).
+        Any other read code -> exception 03; any other MEI type -> exception 01.
+        If the objects would overflow one PDU, More Follows / Next Object Id
+        are set so the client can continue."""
+        mei, read_code, object_id = pdu[1], pdu[2], pdu[3]
+        if mei != MEI_READ_DEVICE_ID:
+            return self._exc(FC_READ_DEVICE_ID, EXC_ILLEGAL_FUNCTION)
+        if read_code == 0x04:
+            if object_id not in DEVICE_ID_OBJECTS:
+                return self._exc(FC_READ_DEVICE_ID, EXC_ILLEGAL_ADDRESS)
+            ids = [object_id]
+        elif read_code in DEVICE_ID_STREAM_TOP:
+            top = DEVICE_ID_STREAM_TOP[read_code]
+            in_range = [o for o in sorted(DEVICE_ID_OBJECTS) if o <= top]
+            if object_id not in in_range:
+                object_id = 0x00
+            ids = [o for o in in_range if o >= object_id]
+        else:
+            return self._exc(FC_READ_DEVICE_ID, EXC_ILLEGAL_VALUE)
+
+        if self.server.verbose:
+            print("[modbus] %s:%d read device identification (code %d)"
+                  % (self.client_address[0], self.client_address[1], read_code))
+
+        body = bytearray()
+        sent, more, next_id = 0, 0x00, 0x00
+        for oid in ids:
+            val = DEVICE_ID_OBJECTS[oid].encode("ascii")
+            if 7 + len(body) + 2 + len(val) > MODBUS_MAX_PDU:
+                more, next_id = 0xFF, oid
+                break
+            body += bytes((oid, len(val))) + val
+            sent += 1
+        header = bytes((FC_READ_DEVICE_ID, MEI_READ_DEVICE_ID, read_code,
+                        DEVICE_ID_CONFORMITY, more, next_id, sent))
+        return header + bytes(body)
 
 
 class ModbusServer(socketserver.ThreadingTCPServer):
@@ -1565,6 +1647,33 @@ setInterval(poll,400); poll();
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
+def _primary_ip():
+    """Best-effort LAN IP for the connect hint. Opens no listening port and sends
+    no traffic. Tries the routing table first, then falls back to the host's own
+    addresses so it still works on an isolated/offline plant network. Returns the
+    first non-loopback IPv4 found, or None."""
+    # 1) routing choice -- the outbound interface, when a default route exists
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    finally:
+        s.close()
+    # 2) offline fallback -- the host's own configured addresses
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Simulated manufacturing-line PLC")
     ap.add_argument("--host", default="0.0.0.0")
@@ -1595,14 +1704,24 @@ def main():
     threading.Thread(target=hmi.serve_forever, daemon=True).start()
 
     print("=" * 64)
-    print(" Simulated PLC  --  Conveyor Line  Zone 1")
+    print(f" Simulated PLC  --  Conveyor Line  Zone 1   (v{VERSION})")
     print("=" * 64)
-    print(f" Modbus/TCP : {args.host}:{args.modbus_port}  (unit id 1)")
-    print(f" Web HMI    : http://{args.host}:{args.hmi_port}/")
+    if args.host in ("0.0.0.0", "::", ""):
+        connect_host = "127.0.0.1"
+        lan_ip = _primary_ip()
+        bind_note = (f"  [bound on all interfaces; from another host use {lan_ip}]"
+                     if lan_ip else "  [bound on all interfaces]")
+    else:
+        connect_host = args.host
+        bind_note = ""
+    print(f" Modbus/TCP : {connect_host}:{args.modbus_port}  (unit id 1){bind_note}")
+    print(f" Web HMI    : http://{connect_host}:{args.hmi_port}/")
     print(f"   conveyor run  -> coil {COIL_RUN}  (FC05: 0xFF00 on / 0x0000 off)")
     print(f"   speed setpt   -> holding reg {HR_SPEED_SP}  (0-100 %)"
           f"   [now {model.holding[HR_SPEED_SP]} %]")
     print(f"   accel / decel -> holding regs {HR_ACCEL_MS} / {HR_DECEL_MS}  (ms)")
+    print("   device id     -> FC 43 / MEI 14 Read Device Identification"
+          " (basic + regular)")
     print("   HMI speed station: slider, numeric entry, +/-1 and +/-5 nudge,")
     print("   presets, and up/down arrow keys (shift = 10 %).")
     print(f" Motor continuous rating: {CONTINUOUS_SPEED_PCT:.0f} % belt speed --"
